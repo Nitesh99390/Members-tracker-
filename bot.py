@@ -1,1140 +1,563 @@
 """
-╔══════════════════════════════════════════════════════════════════════╗
-║   Telegram Membership Manager Bot — Professional Edition  v12.0      ║
-║   Library : python-telegram-bot (v20+)                               ║
-║   Storage : Supabase (PostgreSQL) + psycopg2-pool                    ║
-║   Server  : Flask (Render.com Web Service Compatibility)             ║
-║   Schedule: Built-in JobQueue (1-min auto-kick sweep)                ║
-║                                                                       ║
-║   v12.0 Improvements:                                                 ║
-║   - Fixed inverted join-detection logic in track_chat_member          ║
-║   - Connection pooling (ThreadedConnectionPool) — no per-call connect ║
-║   - Timezone-aware datetime throughout (no naive-datetime bugs)       ║
-║   - Reminder dedup via last_reminded column (no double pings)        ║
-║   - Safe mlist chunking (respects Telegram 4096 char limit)          ║
-║   - Robust emoji logic using timedelta, not string parsing            ║
-║   - Batch expired fetch → single query, not N+1                      ║
-║   - Graceful callback error replies instead of silent failures        ║
-║   - Flask starts before polling (no port-binding race on Render)      ║
-║   - Removed dead admins-table is_admin path; pure Telegram API check  ║
-╚══════════════════════════════════════════════════════════════════════╝
+Telegram Membership Bot — Lite v13
+==================================
+Simple, button-free, low-resource membership manager.
+
+Env vars:
+  BOT_TOKEN      Telegram bot token (required)
+  DATABASE_URL   PostgreSQL / Supabase URL (required)
+  PORT           If set (Render/Railway), a tiny health server starts on it
+
+Admin flow (sab kuch PM me, plain text commands):
+  1. Bot ko group me Admin banao  -> group auto-register
+  2. Naya member join kare        -> bot admin ko PM karta hai
+  3. Us PM par reply karo: /add 30 -> 30 din ki membership
+  4. Expiry par bot khud member ko group se nikaal deta hai
+
+Design for low footprint:
+  - No Flask, no APScheduler, no inline keyboards, no file logs
+  - 1-3 DB connections (SimpleConnectionPool), tuple cursors
+  - Only 3 update types polled (message, chat_member, my_chat_member)
+  - One background asyncio loop does kick + reminder sweep
 """
 
 from __future__ import annotations
 
-# ==========================================================================
-#  IMPORTS
-# ==========================================================================
 import asyncio
-import json
 import logging
 import os
 import re
 import sys
 import threading
-import time
-from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
-from logging.handlers import RotatingFileHandler
-from typing import Any, Generator, List, Optional
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from typing import Optional
 
 import psycopg2
-from psycopg2.extras import RealDictCursor
-from psycopg2.pool import ThreadedConnectionPool
-from flask import Flask
+from psycopg2 import pool as pg_pool
 
-from telegram import (
-    ChatMember,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Update,
-)
-from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError
+from telegram import ChatMember, Update
+from telegram.error import RetryAfter, TelegramError
 from telegram.ext import (
     Application,
-    CallbackQueryHandler,
     ChatMemberHandler,
     CommandHandler,
     ContextTypes,
+    filters,
 )
 
+# --------------------------------------------------------------------------
+# Config
+# --------------------------------------------------------------------------
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+PORT = os.getenv("PORT", "").strip()
 
-# ==========================================================================
-#  CONFIGURATION
-# ==========================================================================
-BOT_TOKEN:    str = os.getenv("BOT_TOKEN", "").strip()
-DATABASE_URL: str = os.getenv("DATABASE_URL", "").strip()
-PORT:         int = int(os.getenv("PORT", "8080"))
-LOG_FILE:     str = os.getenv("LOG_FILE", "membership_bot.log")
-
-# Timezone — India Standard Time (UTC+5:30)
 IST = timezone(timedelta(hours=5, minutes=30))
+SWEEP_INTERVAL = int(os.getenv("SWEEP_INTERVAL", "60"))   # seconds between expiry checks
+REMIND_EVERY = 60                                         # sweeps (~1 hour) between reminder checks
+REMIND_HOURS = 24                                         # remind when ~24h left
+TG_MAX = 3900
 
-# Background job intervals
-AUTO_KICK_INTERVAL: int = 60    # seconds
-REMINDER_INTERVAL:  int = 3600  # seconds
-
-# Reminder windows: send DM when expiry is this many hours away
-REMINDER_HOURS: tuple[int, ...] = (72, 24)
-
-# Preset plans shown as inline buttons
-PRESET_PLANS: dict[str, str] = {
-    "1m":   "🧪 1 Minute (Test)",
-    "7d":   "🥉 7 Days",
-    "30d":  "🥇 30 Days",
-    "90d":  "💎 90 Days",
-    "180d": "🔥 180 Days",
-    "365d": "👑 365 Days",
-}
-
-# Telegram hard limit for message text
-TG_MAX_CHARS = 4000   # slightly under 4096 for safety
-PER_PAGE     = 15     # members per mlist page
+logging.basicConfig(
+    level=logging.WARNING,
+    format="%(asctime)s %(levelname)s %(message)s",
+    stream=sys.stdout,
+)
+log = logging.getLogger("bot")
+log.setLevel(logging.INFO)
 
 
-# ==========================================================================
-#  LOGGING
-# ==========================================================================
-def _setup_logging() -> logging.Logger:
-    fmt = logging.Formatter(
-        "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-    root = logging.getLogger()
-    root.setLevel(logging.INFO)
-
-    ch = logging.StreamHandler(sys.stdout)
-    ch.setFormatter(fmt)
-    root.addHandler(ch)
-
-    try:
-        fh = RotatingFileHandler(LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8")
-        fh.setFormatter(fmt)
-        root.addHandler(fh)
-    except OSError as exc:
-        root.warning("Cannot open log file %s: %s", LOG_FILE, exc)
-
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("telegram").setLevel(logging.WARNING)
-    return logging.getLogger("membership_bot")
-
-log = _setup_logging()
-
-
-# ==========================================================================
-#  DATABASE LAYER — psycopg2 ThreadedConnectionPool
-# ==========================================================================
-_pool: Optional[ThreadedConnectionPool] = None
-
-
-def get_pool() -> ThreadedConnectionPool:
-    """Lazy-init a connection pool (2–10 connections)."""
-    global _pool
-    if _pool is None:
-        if not DATABASE_URL:
-            raise ValueError("DATABASE_URL is not set!")
-        _pool = ThreadedConnectionPool(2, 10, DATABASE_URL, cursor_factory=RealDictCursor)
-        log.info("✅ Database connection pool initialised.")
-    return _pool
-
-
-@contextmanager
-def db_cursor() -> Generator:
-    """Borrow a connection from the pool; commit on success, rollback on error."""
-    pool = get_pool()
-    conn = pool.getconn()
-    conn.autocommit = False
-    try:
-        with conn.cursor() as cur:
-            yield cur
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        pool.putconn(conn)
-
-
-def _to_aware(dt: datetime) -> datetime:
-    """Ensure a datetime is IST-aware (handles naive datetimes from DB)."""
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=IST)
-    return dt.astimezone(IST)
-
-
-def parse_db_row(row: Optional[Any]) -> Optional[dict]:
-    """Convert RealDictRow → plain dict; parse ISO strings → aware datetimes."""
-    if not row:
-        return None
-    out = dict(row)
-    dt_cols = {"expiry", "joined", "updated", "removed", "ts"}
-    for k, v in out.items():
-        if v and k in dt_cols:
-            try:
-                out[k] = _to_aware(datetime.fromisoformat(str(v)))
-            except (TypeError, ValueError):
-                pass
-        elif v and k == "extra":
-            try:
-                out[k] = json.loads(v)
-            except (TypeError, ValueError, json.JSONDecodeError):
-                out[k] = {}
-    return out
-
-
-def init_db() -> None:
-    """Create tables + indexes. Safe to call on every startup."""
-    with db_cursor() as c:
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS members (
-                chat_id       BIGINT  NOT NULL,
-                user_id       BIGINT  NOT NULL,
-                expiry        TEXT,
-                days          TEXT,
-                added_by      BIGINT,
-                active        INTEGER DEFAULT 1,
-                joined        TEXT,
-                updated       TEXT,
-                remove_reason TEXT,
-                removed       TEXT,
-                last_reminded TEXT,       -- ISO timestamp of last reminder DM
-                PRIMARY KEY (chat_id, user_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS groups (
-                chat_id  BIGINT PRIMARY KEY,
-                title    TEXT,
-                added_by BIGINT,
-                ts       TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS logs (
-                id        SERIAL PRIMARY KEY,
-                chat_id   BIGINT,
-                actor_id  BIGINT,
-                target_id BIGINT,
-                action    TEXT,
-                extra     TEXT,
-                ts        TEXT
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_members_active_expiry
-                ON members (active, expiry);
-            CREATE INDEX IF NOT EXISTS idx_members_chat_active
-                ON members (chat_id, active);
-            CREATE INDEX IF NOT EXISTS idx_logs_chat_ts
-                ON logs (chat_id, ts DESC);
-        """)
-    log.info("✅ PostgreSQL schema ready.")
-
-
-# ==========================================================================
-#  FLASK WEB SERVER  (keeps Render port happy)
-# ==========================================================================
-web_app = Flask(__name__)
-
-
-@web_app.route("/")
-def index():
-    return "✅ Membership Bot is running 24/7!"
-
-
-@web_app.route("/health")
-def health():
-    return {"status": "ok", "ts": now_ist().isoformat()}, 200
-
-
-def _run_flask() -> None:
-    web_app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
-
-
-# ==========================================================================
-#  TIME & FORMAT HELPERS
-# ==========================================================================
-def now_ist() -> datetime:
+# --------------------------------------------------------------------------
+# Time helpers
+# --------------------------------------------------------------------------
+def now() -> datetime:
     return datetime.now(IST)
 
 
-def parse_duration(d_str: str) -> timedelta:
-    """Parse strings like '30d', '12h', '45m', '7' (days) → timedelta."""
-    s = str(d_str).strip().lower()
+def to_dt(s) -> Optional[datetime]:
+    if not s:
+        return None
     try:
-        if s.endswith("m"): return timedelta(minutes=int(s[:-1]))
-        if s.endswith("h"): return timedelta(hours=int(s[:-1]))
-        if s.endswith("d"): return timedelta(days=int(s[:-1]))
-        return timedelta(days=int(s))
-    except (ValueError, TypeError):
-        return timedelta(0)
+        d = datetime.fromisoformat(str(s))
+        return d.replace(tzinfo=IST) if d.tzinfo is None else d.astimezone(IST)
+    except ValueError:
+        return None
 
 
-def time_left(expiry_dt: datetime) -> timedelta:
-    """Return timedelta remaining (can be negative = already expired)."""
-    return _to_aware(expiry_dt) - now_ist()
+def parse_days(s: str) -> Optional[timedelta]:
+    """'30' / '30d' -> days, '12h' -> hours, '45m' -> minutes."""
+    s = s.strip().lower()
+    try:
+        if s.endswith("h"):
+            td = timedelta(hours=int(s[:-1]))
+        elif s.endswith("m"):
+            td = timedelta(minutes=int(s[:-1]))
+        else:
+            td = timedelta(days=int(s.rstrip("d")))
+    except ValueError:
+        return None
+    return td if td.total_seconds() > 0 else None
 
 
-def format_time_left(expiry_dt: datetime) -> str:
-    delta = time_left(expiry_dt)
-    if delta.total_seconds() <= 0:
-        return "Expired"
-    if delta.days > 0:
-        return f"{delta.days} days"
-    hours, rem = divmod(int(delta.total_seconds()), 3600)
+def left(expiry: datetime) -> str:
+    d = expiry - now()
+    secs = int(d.total_seconds())
+    if secs <= 0:
+        return "expired"
+    days, rem = divmod(secs, 86400)
+    hours, rem = divmod(rem, 3600)
     mins = rem // 60
-    if hours > 0:
-        return f"{hours}h {mins}m"
-    return f"{mins} mins"
+    if days:
+        return f"{days} din" + (f" {hours} ghante" if hours else "")
+    if hours:
+        return f"{hours} ghante" + (f" {mins} min" if mins else "")
+    return f"{max(1, mins)} min"
 
 
-def expiry_emoji(expiry_dt: datetime) -> str:
-    """🔴 if ≤3 days left, 🟢 otherwise — uses timedelta, not string parsing."""
-    delta = time_left(expiry_dt)
-    return "🔴" if delta.total_seconds() <= 0 or delta.days < 3 else "🟢"
+def fmt(dt: datetime) -> str:
+    return dt.strftime("%d %b %Y, %I:%M %p")
 
 
-_MD_ESCAPE = re.compile(r"([_*`\[])")
+# --------------------------------------------------------------------------
+# Database (tiny pool, tuple rows, auto-reconnect)
+# --------------------------------------------------------------------------
+_pool: Optional[pg_pool.SimpleConnectionPool] = None
 
 
-def escape_md(text: Any) -> str:
-    return _MD_ESCAPE.sub(r"\\\1", str(text or ""))
+def _get_pool() -> pg_pool.SimpleConnectionPool:
+    global _pool
+    if _pool is None:
+        _pool = pg_pool.SimpleConnectionPool(1, 3, DATABASE_URL)
+    return _pool
 
 
-def fmt_expiry(dt: datetime) -> str:
-    return _to_aware(dt).strftime("%d %b %Y, %I:%M %p")
+def q(sql: str, args: tuple = (), fetch: str = "") -> object:
+    """Run one statement. fetch = '' | 'one' | 'all'. Retries once on a dead connection."""
+    p = _get_pool()
+    for attempt in (1, 2):
+        conn = p.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql, args)
+                out = cur.fetchone() if fetch == "one" else cur.fetchall() if fetch == "all" else None
+            conn.commit()
+            p.putconn(conn)
+            return out
+        except (psycopg2.OperationalError, psycopg2.InterfaceError):
+            p.putconn(conn, close=True)
+            if attempt == 2:
+                raise
+        except Exception:
+            conn.rollback()
+            p.putconn(conn)
+            raise
 
 
-# ==========================================================================
-#  DOMAIN HELPERS
-# ==========================================================================
-async def is_admin(user_id: int, chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Check Telegram directly — no stale local admin table."""
-    try:
-        member = await context.bot.get_chat_member(chat_id, user_id)
-        return member.status in (ChatMember.ADMINISTRATOR, ChatMember.OWNER)
-    except TelegramError:
-        return False
+def init_db() -> None:
+    q("""
+        CREATE TABLE IF NOT EXISTS members (
+            chat_id       BIGINT NOT NULL,
+            user_id       BIGINT NOT NULL,
+            expiry        TEXT,
+            days          TEXT,
+            added_by      BIGINT,
+            active        INTEGER DEFAULT 1,
+            joined        TEXT,
+            updated       TEXT,
+            remove_reason TEXT,
+            removed       TEXT,
+            last_reminded TEXT,
+            PRIMARY KEY (chat_id, user_id)
+        );
+        CREATE TABLE IF NOT EXISTS groups (
+            chat_id  BIGINT PRIMARY KEY,
+            title    TEXT,
+            added_by BIGINT,
+            ts       TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_members_active_expiry ON members (active, expiry);
+        CREATE INDEX IF NOT EXISTS idx_members_chat_active  ON members (chat_id, active);
+    """)
 
 
-async def log_action(
-    chat_id: int, actor_id: int, action: str,
-    target_id: Optional[int] = None, extra: Optional[dict] = None,
-) -> None:
-    with db_cursor() as c:
-        c.execute(
-            "INSERT INTO logs (chat_id,actor_id,target_id,action,extra,ts) VALUES (%s,%s,%s,%s,%s,%s)",
-            (chat_id, actor_id, target_id, action, json.dumps(extra or {}), now_ist().isoformat()),
-        )
+def my_groups(user_id: int) -> list[tuple[int, str]]:
+    return q("SELECT chat_id, title FROM groups WHERE added_by=%s ORDER BY ts", (user_id,), "all") or []
 
 
-async def add_membership(chat_id: int, user_id: int, plan_str: str, added_by: int) -> datetime:
-    expiry = now_ist() + parse_duration(plan_str)
-    with db_cursor() as c:
-        c.execute("SELECT joined FROM members WHERE chat_id=%s AND user_id=%s", (chat_id, user_id))
-        row = parse_db_row(c.fetchone())
-        joined_iso = (
-            row["joined"].isoformat()
-            if row and isinstance(row.get("joined"), datetime)
-            else now_ist().isoformat()
-        )
-        c.execute(
-            """
-            INSERT INTO members
-                (chat_id, user_id, expiry, days, added_by, active, joined, updated, last_reminded)
-            VALUES (%s, %s, %s, %s, %s, 1, %s, %s, NULL)
-            ON CONFLICT (chat_id, user_id) DO UPDATE SET
-                expiry        = excluded.expiry,
-                days          = excluded.days,
-                added_by      = excluded.added_by,
-                active        = 1,
-                updated       = excluded.updated,
-                last_reminded = NULL
-            """,
-            (chat_id, user_id, expiry.isoformat(), plan_str, added_by, joined_iso, now_ist().isoformat()),
-        )
-    await log_action(chat_id, added_by, "add", user_id, {"plan": plan_str})
+def upsert_member(chat_id: int, user_id: int, td: timedelta, plan: str, by: int) -> datetime:
+    """New member -> now+td. Active member -> expiry+td (renew). Returns new expiry."""
+    row = q("SELECT expiry, active FROM members WHERE chat_id=%s AND user_id=%s", (chat_id, user_id), "one")
+    base = now()
+    if row and row[1] == 1:
+        cur = to_dt(row[0])
+        if cur and cur > base:
+            base = cur
+    expiry = base + td
+    ts = now().isoformat()
+    q("""
+        INSERT INTO members (chat_id,user_id,expiry,days,added_by,active,joined,updated,last_reminded)
+        VALUES (%s,%s,%s,%s,%s,1,%s,%s,NULL)
+        ON CONFLICT (chat_id,user_id) DO UPDATE SET
+            expiry=EXCLUDED.expiry, days=EXCLUDED.days, added_by=EXCLUDED.added_by,
+            active=1, updated=EXCLUDED.updated, last_reminded=NULL,
+            removed=NULL, remove_reason=NULL
+    """, (chat_id, user_id, expiry.isoformat(), plan, by, ts, ts))
     return expiry
 
 
-async def extend_membership(chat_id: int, user_id: int, extra_plan: str, actor: int) -> Optional[datetime]:
-    with db_cursor() as c:
-        c.execute(
-            "SELECT expiry FROM members WHERE chat_id=%s AND user_id=%s AND active=1",
-            (chat_id, user_id),
-        )
-        row = parse_db_row(c.fetchone())
-        if not row:
-            return None
-        base = max(_to_aware(row["expiry"]), now_ist())
-        new_expiry = base + parse_duration(extra_plan)
-        c.execute(
-            "UPDATE members SET expiry=%s, updated=%s, last_reminded=NULL WHERE chat_id=%s AND user_id=%s",
-            (new_expiry.isoformat(), now_ist().isoformat(), chat_id, user_id),
-        )
-    await log_action(chat_id, actor, "extend", user_id, {"extra_plan": extra_plan})
-    return new_expiry
+def deactivate(chat_id: int, user_id: int, reason: str) -> None:
+    q("UPDATE members SET active=0, removed=%s, remove_reason=%s WHERE chat_id=%s AND user_id=%s",
+      (now().isoformat(), reason, chat_id, user_id))
 
 
-async def remove_membership(chat_id: int, user_id: int, actor: int, reason: str = "manual") -> None:
-    with db_cursor() as c:
-        c.execute(
-            "UPDATE members SET active=0, removed=%s, remove_reason=%s WHERE chat_id=%s AND user_id=%s",
-            (now_ist().isoformat(), reason, chat_id, user_id),
-        )
-    await log_action(chat_id, actor, "remove", user_id, {"reason": reason})
-
-
-# ==========================================================================
-#  TELEGRAM HELPERS
-# ==========================================================================
-async def kick_member(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Ban + immediately unban = soft kick (user can rejoin via invite link)."""
-    for _ in range(2):
-        try:
-            await context.bot.ban_chat_member(chat_id, user_id)
-            await asyncio.sleep(0.5)
-            await context.bot.unban_chat_member(chat_id, user_id)
-            return True
-        except RetryAfter as e:
-            await asyncio.sleep(e.retry_after + 1)
-        except (Forbidden, BadRequest):
-            return False
-        except TelegramError:
-            return False
-    return False
-
-
-async def send_pm(
-    context: ContextTypes.DEFAULT_TYPE,
-    user_id: int,
-    text: str,
-    reply_markup: Optional[InlineKeyboardMarkup] = None,
-) -> bool:
+# --------------------------------------------------------------------------
+# Telegram helpers
+# --------------------------------------------------------------------------
+async def pm(bot, user_id: int, text: str) -> bool:
     try:
-        await context.bot.send_message(
-            user_id, text, parse_mode="Markdown", reply_markup=reply_markup
-        )
+        await bot.send_message(user_id, text)
         return True
     except TelegramError:
         return False
 
 
-async def safe_edit(query: Any, text: str, reply_markup: Optional[InlineKeyboardMarkup] = None) -> None:
-    """Edit callback message; if text is too long, truncate gracefully."""
-    if len(text) > TG_MAX_CHARS:
-        text = text[: TG_MAX_CHARS - 20] + "\n…_(truncated)_"
+async def kick(bot, chat_id: int, user_id: int) -> bool:
+    """Ban + unban = remove but allow re-join via invite link."""
     try:
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=reply_markup)
-    except BadRequest as e:
-        if "not modified" not in str(e).lower():
-            log.warning("edit_message_text failed: %s", e)
+        await bot.ban_chat_member(chat_id, user_id)
+        await bot.unban_chat_member(chat_id, user_id, only_if_banned=True)
+        return True
+    except RetryAfter as e:
+        await asyncio.sleep(e.retry_after + 1)
+        try:
+            await bot.ban_chat_member(chat_id, user_id)
+            await bot.unban_chat_member(chat_id, user_id, only_if_banned=True)
+            return True
+        except TelegramError:
+            return False
+    except TelegramError:
+        return False
 
 
-# ==========================================================================
-#  KEYBOARD BUILDERS
-# ==========================================================================
-def plan_keyboard(chat_id: int, user_id: int) -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton(label, callback_data=f"plan|{chat_id}|{user_id}|{plan}")]
-        for plan, label in PRESET_PLANS.items()
-    ]
-    rows.append([InlineKeyboardButton("✏️ Custom Plan", callback_data=f"custom|{chat_id}|{user_id}")])
-    return InlineKeyboardMarkup(rows)
+async def reply(update: Update, text: str) -> None:
+    for i in range(0, len(text), TG_MAX):
+        await update.message.reply_text(text[i:i + TG_MAX])
 
 
-def confirm_keyboard(chat_id: int, user_id: int, plan_str: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Confirm", callback_data=f"confirm|{chat_id}|{user_id}|{plan_str}"),
-        InlineKeyboardButton("❌ Cancel",  callback_data="cancel"),
-    ]])
+HELP = (
+    "👋 Membership Bot\n\n"
+    "Setup: mujhe apne group me Admin banao (members remove karne ki permission ke saath). Bas itna hi.\n\n"
+    "Commands:\n"
+    "/add <user_id> <days>  — membership do / badhao\n"
+    "/remove <user_id>  — member ko group se nikaalo\n"
+    "/check <user_id>  — ek member ki expiry dekho\n"
+    "/list  — sab active members\n"
+    "/groups  — apne groups dekho / select karo\n\n"
+    "Tip: jab koi naya member join karega, main yahan message bhejunga. "
+    "Us message par reply karke sirf  /add 30  likho — ho gaya."
+)
+
+_ID_RE = re.compile(r"ID:\s*(\d+)")
+_GID_RE = re.compile(r"Group ID:\s*(-?\d+)")
 
 
-def main_panel_keyboard(chat_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("👥 Members List",  callback_data=f"mlist|{chat_id}|0"),
-         InlineKeyboardButton("📊 Stats",          callback_data=f"stats|{chat_id}")],
-        [InlineKeyboardButton("⚠️ Expiring Soon", callback_data=f"expiring|{chat_id}"),
-         InlineKeyboardButton("📋 Expiry Report", callback_data=f"report|{chat_id}")],
-        [InlineKeyboardButton("🔴 Expired List",  callback_data=f"expired|{chat_id}"),
-         InlineKeyboardButton("📜 Recent Logs",   callback_data=f"logs|{chat_id}")],
-    ])
+def _target_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> tuple[Optional[int], Optional[str]]:
+    """Figure out which group a command refers to. Returns (chat_id, error_text)."""
+    rep = update.message.reply_to_message
+    if rep and rep.text:
+        m = _GID_RE.search(rep.text)
+        if m:
+            return int(m.group(1)), None
+
+    groups = my_groups(update.effective_user.id)
+    if not groups:
+        return None, "❌ Koi group registered nahi hai. Pehle mujhe group me Admin banao."
+    if len(groups) == 1:
+        return groups[0][0], None
+
+    sel = context.user_data.get("g")
+    if sel and any(sel == g[0] for g in groups):
+        return sel, None
+    return None, f"Aapke {len(groups)} groups hain. Pehle /groups se ek select karo."
 
 
-def member_action_keyboard(chat_id: int, user_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Extend", callback_data=f"extmenu|{chat_id}|{user_id}"),
-         InlineKeyboardButton("🗑️ Remove", callback_data=f"remconfirm|{chat_id}|{user_id}")],
-        [InlineKeyboardButton("🔙 Panel",  callback_data=f"panel|{chat_id}")],
-    ])
+def _target_user(update: Update, args: list[str]) -> tuple[Optional[int], list[str]]:
+    """User id from args, or from the replied-to join message. Returns (user_id, remaining_args)."""
+    if args and args[0].isdigit():
+        return int(args[0]), args[1:]
+    rep = update.message.reply_to_message
+    if rep and rep.text:
+        m = _ID_RE.search(rep.text)
+        if m:
+            return int(m.group(1)), args
+    return None, args
 
 
-def extend_menu_keyboard(chat_id: int, user_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ 1 Min",   callback_data=f"doext|{chat_id}|{user_id}|1m"),
-         InlineKeyboardButton("➕ 7 Days",  callback_data=f"doext|{chat_id}|{user_id}|7d"),
-         InlineKeyboardButton("➕ 30 Days", callback_data=f"doext|{chat_id}|{user_id}|30d")],
-        [InlineKeyboardButton("➕ 60 Days", callback_data=f"doext|{chat_id}|{user_id}|60d"),
-         InlineKeyboardButton("➕ 90 Days", callback_data=f"doext|{chat_id}|{user_id}|90d")],
-        [InlineKeyboardButton("🔙 Back",    callback_data=f"memberinfo|{chat_id}|{user_id}")],
-    ])
+# --------------------------------------------------------------------------
+# Commands (private chat only)
+# --------------------------------------------------------------------------
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await reply(update, HELP)
 
 
-def back_to_panel_kb(chat_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Panel", callback_data=f"panel|{chat_id}")]])
+async def cmd_groups(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    groups = my_groups(update.effective_user.id)
+    if not groups:
+        return await reply(update, "❌ Koi group registered nahi hai. Pehle mujhe group me Admin banao.")
+
+    if context.args and context.args[0].isdigit():
+        n = int(context.args[0])
+        if 1 <= n <= len(groups):
+            context.user_data["g"] = groups[n - 1][0]
+            return await reply(update, f"✅ Selected: {groups[n - 1][1]}")
+        return await reply(update, "❌ Galat number.")
+
+    sel = context.user_data.get("g")
+    lines = ["📌 Aapke groups:\n"]
+    for i, (cid, title) in enumerate(groups, 1):
+        mark = " ✅" if cid == sel or len(groups) == 1 else ""
+        lines.append(f"{i}. {title}{mark}")
+    if len(groups) > 1:
+        lines.append("\nSelect karne ke liye:  /groups <number>")
+    await reply(update, "\n".join(lines))
 
 
-# ==========================================================================
-#  CHAT-MEMBER EVENT HANDLERS
-# ==========================================================================
-async def track_bot_promotion(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Fires when the bot itself gets promoted/demoted."""
-    result = update.my_chat_member
-    if not result:
-        return
+async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid, rest = _target_user(update, context.args)
+    if uid is None or not rest:
+        return await reply(update, "Use:  /add <user_id> <days>\nExample:  /add 123456789 30\n\n"
+                                   "Ya join-message par reply karke:  /add 30")
+    td = parse_days(rest[0])
+    if td is None:
+        return await reply(update, "❌ Days galat hai. Example: 30  (ya 12h, 45m)")
 
-    chat, user = result.chat, result.from_user
-    admin_states = (ChatMember.ADMINISTRATOR, ChatMember.OWNER)
+    cid, err = _target_group(update, context)
+    if err:
+        return await reply(update, err)
 
-    # Only react when bot transitions INTO an admin state
-    was_admin = result.old_chat_member.status in admin_states
-    now_admin = result.new_chat_member.status in admin_states
-    if was_admin or not now_admin:
-        return
+    expiry = upsert_member(cid, uid, td, rest[0], update.effective_user.id)
+    title = next((t for c, t in my_groups(update.effective_user.id) if c == cid), str(cid))
 
-    with db_cursor() as c:
-        c.execute(
-            """
-            INSERT INTO groups (chat_id, title, added_by, ts)
-            VALUES (%s, %s, %s, %s)
-            ON CONFLICT (chat_id) DO UPDATE SET
-                title    = excluded.title,
-                added_by = excluded.added_by
-            """,
-            (chat.id, chat.title, user.id, now_ist().isoformat()),
-        )
-    await send_pm(
-        context, user.id,
-        f"✅ *{escape_md(chat.title)}* registered!\n\n"
-        "Jab bhi koi naya member join karega, main aapko PM mein plan selection menu bhejunga. 🎉",
-    )
+    sent = await pm(context.bot, uid,
+                    f"✅ {title} me aapki membership active hai.\n"
+                    f"📅 Expiry: {fmt(expiry)} IST ({left(expiry)} baaki)")
+    await reply(update,
+                f"✅ Done\n👤 {uid}\n📌 {title}\n📅 Expiry: {fmt(expiry)} IST\n"
+                + ("📩 User ko PM bhej diya." if sent else "ℹ️ User ka PM band hai (membership phir bhi active hai)."))
 
 
-async def track_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Fires when ANY member's status changes in a tracked group."""
-    result = update.chat_member
-    if not result:
-        return
+async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid, _ = _target_user(update, context.args)
+    if uid is None:
+        return await reply(update, "Use:  /remove <user_id>")
+    cid, err = _target_group(update, context)
+    if err:
+        return await reply(update, err)
 
-    chat = result.chat
-    user = result.new_chat_member.user
-    if user.is_bot:
-        return
-
-    old_status = result.old_chat_member.status
-    new_status = result.new_chat_member.status
-
-    # ✅ FIX: User is joining when old=left/kicked AND new=member/restricted
-    joining_from = (ChatMember.LEFT, ChatMember.BANNED)
-    joining_to   = (ChatMember.MEMBER, ChatMember.RESTRICTED)
-
-    if old_status not in joining_from or new_status not in joining_to:
-        return   # Not a fresh join — ignore
-
-    with db_cursor() as c:
-        c.execute("SELECT added_by FROM groups WHERE chat_id=%s", (chat.id,))
-        grp = parse_db_row(c.fetchone())
-    if not grp:
-        return
-
-    text = (
-        f"🆕 *New Member Joined!*\n\n"
-        f"📌 Group: *{escape_md(chat.title)}*\n"
-        f"👤 Member: {escape_md(user.full_name)}\n"
-        f"🆔 ID: `{user.id}`\n\n"
-        "👇 Neeche se plan select karein:"
-    )
-    await send_pm(context, grp["added_by"], text, reply_markup=plan_keyboard(chat.id, user.id))
+    deactivate(cid, uid, "manual")
+    ok = await kick(context.bot, cid, uid)
+    await reply(update, f"{'✅ Member group se nikaal diya' if ok else '⚠️ Record update hua, par kick nahi ho paya (bot admin hai?)'}: {uid}")
 
 
-# ==========================================================================
-#  COMMAND HANDLERS
-# ==========================================================================
-async def _delete_and_pm(update: Update, context: ContextTypes.DEFAULT_TYPE, msg: str) -> None:
-    """Delete group message and redirect user to PM."""
+async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid, _ = _target_user(update, context.args)
+    if uid is None:
+        return await reply(update, "Use:  /check <user_id>")
+    cid, err = _target_group(update, context)
+    if err:
+        return await reply(update, err)
+
+    row = q("SELECT expiry, active FROM members WHERE chat_id=%s AND user_id=%s", (cid, uid), "one")
+    if not row:
+        return await reply(update, f"❌ {uid} ka koi record nahi.")
+    exp = to_dt(row[0])
+    status = "🟢 Active" if row[1] == 1 and exp and exp > now() else "🔴 Inactive"
+    await reply(update, f"👤 {uid}\n{status}\n📅 Expiry: {fmt(exp) if exp else '-'} IST\n⏳ {left(exp) if exp else '-'} baaki")
+
+
+async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cid, err = _target_group(update, context)
+    if err:
+        return await reply(update, err)
+    rows = q("SELECT user_id, expiry FROM members WHERE chat_id=%s AND active=1 ORDER BY expiry", (cid,), "all") or []
+    if not rows:
+        return await reply(update, "Koi active member nahi hai.")
+    lines = [f"👥 Active members: {len(rows)}\n"]
+    for i, (uid, exp) in enumerate(rows, 1):
+        d = to_dt(exp)
+        dot = "🔴" if d and (d - now()) < timedelta(days=3) else "🟢"
+        lines.append(f"{i}. {uid} {dot} {left(d) if d else '-'}")
+    await reply(update, "\n".join(lines))
+
+
+async def cmd_in_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Commands sent inside a group: delete silently, keep group clean."""
     try:
         await update.message.delete()
     except TelegramError:
         pass
-    await send_pm(context, update.effective_user.id, msg)
 
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.effective_chat.type == "private":
-        await update.message.reply_text(
-            "👋 *Welcome to Membership Manager Bot!*\n\n"
-            "Mujhe kisi bhi Group/Channel mein *Admin* promote karein — main automatically register ho jaunga.\n\n"
-            "📖 `/help` — commands list\n"
-            "⚙️ `/panel` — admin control panel",
-            parse_mode="Markdown",
-        )
+# --------------------------------------------------------------------------
+# Membership events
+# --------------------------------------------------------------------------
+_ADMIN = (ChatMember.ADMINISTRATOR, ChatMember.OWNER)
 
 
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "📖 *Commands (PM mein use karein):*\n\n"
-        "`/panel` — Admin Control Panel (members manage karein)\n"
-        "`/start` — Bot restart/welcome\n"
-        "`/help`  — Yeh message",
-        parse_mode="Markdown",
-    )
-
-
-async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.effective_chat.type != "private":
-        try:
-            await update.message.delete()
-        except TelegramError:
-            pass
-
-
-async def cmd_addmember(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.effective_chat.type != "private":
-        return await _delete_and_pm(update, context, "❌ `/addmember` PM mein use karein.")
-    await update.message.reply_text(
-        "💡 Jab user group join karega, main auto-menu bhejunga.\n`/panel` se bhi manage kar sakte hain.",
-        parse_mode="Markdown",
-    )
-
-
-async def cmd_removemember(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.effective_chat.type != "private":
-        return await _delete_and_pm(update, context, "❌ Commands sirf PM mein use karein.")
-    await update.message.reply_text("💡 `/panel` se users manage karein.", parse_mode="Markdown")
-
-
-async def cmd_extend(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.effective_chat.type != "private":
-        return await _delete_and_pm(update, context, "❌ Commands sirf PM mein use karein.")
-    await update.message.reply_text("💡 `/panel` se users manage karein.", parse_mode="Markdown")
-
-
-async def cmd_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.effective_chat.type != "private":
-        return await _delete_and_pm(update, context, "⚙️ Panel PM mein khulta hai — yahan open karein.")
-
-    with db_cursor() as c:
-        c.execute("SELECT chat_id, title FROM groups WHERE added_by=%s", (update.effective_user.id,))
-        groups = c.fetchall()
-
-    if not groups:
-        return await update.message.reply_text(
-            "❌ Koi registered group nahi mila.\nPehle mujhe kisi group mein Admin promote karein."
-        )
-
-    for grp in groups:
-        await update.message.reply_text(
-            f"⚙️ *Admin Control Panel*\n📌 {escape_md(grp['title'])} (`{grp['chat_id']}`)",
-            parse_mode="Markdown",
-            reply_markup=main_panel_keyboard(grp["chat_id"]),
-        )
-
-
-# ==========================================================================
-#  CALLBACK QUERY HANDLERS
-# ==========================================================================
-async def cb_plan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    _, chat_id, user_id, plan_str = query.data.split("|")
-    expiry = now_ist() + parse_duration(plan_str)
-    await safe_edit(
-        query,
-        f"✅ *Confirm kijiye:*\n\n"
-        f"👤 User ID: `{user_id}`\n"
-        f"📦 Plan: *{plan_str.upper()}*\n"
-        f"📅 Expiry: *{fmt_expiry(expiry)} IST*",
-        confirm_keyboard(int(chat_id), int(user_id), plan_str),
-    )
-
-
-async def cb_custom(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    _, chat_id, user_id = query.data.split("|")
-    await safe_edit(
-        query,
-        f"✏️ *Custom Plan:*\n\n"
-        f"User `{user_id}` ke liye `/addmember {user_id} <duration>` type karein\n"
-        f"_Example: 45d, 12h, 90m_",
-    )
-
-
-async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer("⏳ Processing…")
-    _, chat_id, user_id, plan_str = query.data.split("|")
-    chat_id, user_id = int(chat_id), int(user_id)
-
-    expiry = await add_membership(chat_id, user_id, plan_str, query.from_user.id)
-
-    target_name = str(user_id)
-    try:
-        target = await context.bot.get_chat(user_id)
-        target_name = target.full_name
-    except TelegramError:
-        pass
-
-    pm_sent = False
-    try:
-        chat = await context.bot.get_chat(chat_id)
-        pm_sent = await send_pm(
-            context, user_id,
-            f"🎉 *Welcome!*\n\n"
-            f"✅ *{escape_md(chat.title)}* mein membership activate ho gayi!\n"
-            f"📦 Plan: {plan_str.upper()}\n"
-            f"📅 Expiry: {fmt_expiry(expiry)} IST",
-        )
-    except TelegramError:
-        pass
-
-    await safe_edit(
-        query,
-        f"✅ *Membership Activated!*\n\n"
-        f"👤 Member: {escape_md(target_name)}\n"
-        f"📦 Plan: *{plan_str.upper()}*\n"
-        f"📅 Expiry: *{fmt_expiry(expiry)} IST*\n\n"
-        + ("📩 PM bhej diya." if pm_sent else "⚠️ User ka PM disabled hai."),
-    )
-    await query.answer("✅ Done!", show_alert=True)
-
-
-async def cb_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.callback_query.answer()
-    await safe_edit(update.callback_query, "❌ Action cancel ho gayi.")
-
-
-async def cb_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    chat_id = int(query.data.split("|")[1])
-    title = str(chat_id)
-    try:
-        title = (await context.bot.get_chat(chat_id)).title
-    except TelegramError:
-        pass
-    await safe_edit(
-        query,
-        f"⚙️ *Admin Control Panel*\n📌 {escape_md(title)}",
-        main_panel_keyboard(chat_id),
-    )
-
-
-async def cb_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    chat_id = int(query.data.split("|")[1])
-    soon = (now_ist() + timedelta(days=3)).isoformat()
-
-    with db_cursor() as c:
-        c.execute("SELECT COUNT(*) AS cnt FROM members WHERE chat_id=%s", (chat_id,))
-        total = c.fetchone()["cnt"]
-        c.execute("SELECT COUNT(*) AS cnt FROM members WHERE chat_id=%s AND active=1", (chat_id,))
-        active = c.fetchone()["cnt"]
-        c.execute(
-            "SELECT COUNT(*) AS cnt FROM members WHERE chat_id=%s AND active=1 AND expiry<=%s",
-            (chat_id, soon),
-        )
-        expiring = c.fetchone()["cnt"]
-
-    await safe_edit(
-        query,
-        f"📊 *Group Statistics*\n\n"
-        f"👥 Total Members : *{total}*\n"
-        f"🟢 Active         : *{active}*\n"
-        f"🔴 Expired/Removed: *{total - active}*\n"
-        f"⚠️ Expiring (3d)  : *{expiring}*",
-        main_panel_keyboard(chat_id),
-    )
-
-
-async def cb_expiring(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    chat_id = int(query.data.split("|")[1])
-    soon = (now_ist() + timedelta(days=3)).isoformat()
-
-    with db_cursor() as c:
-        c.execute(
-            "SELECT * FROM members WHERE chat_id=%s AND active=1 AND expiry<=%s ORDER BY expiry ASC LIMIT 50",
-            (chat_id, soon),
-        )
-        docs = [parse_db_row(r) for r in c.fetchall()]
-
-    if not docs:
-        text = "✅ Abhi koi member expiring nahi hai."
-    else:
-        lines = ["⚠️ *Expiring Soon (≤3 days):*\n"]
-        for d in docs:
-            lines.append(f"• `{d['user_id']}` — {format_time_left(d['expiry'])} left")
-        text = "\n".join(lines)
-
-    await safe_edit(query, text, back_to_panel_kb(chat_id))
-
-
-async def cb_expired(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    chat_id = int(query.data.split("|")[1])
-
-    with db_cursor() as c:
-        c.execute(
-            "SELECT * FROM members WHERE chat_id=%s AND active=0 ORDER BY removed DESC LIMIT 20",
-            (chat_id,),
-        )
-        docs = [parse_db_row(r) for r in c.fetchall()]
-
-    if not docs:
-        text = "✅ Koi expired member nahi hai."
-    else:
-        lines = ["🔴 *Expired Members (Last 20):*\n"]
-        for d in docs:
-            reason = (d.get("remove_reason") or "auto").replace("_", " ").title()
-            lines.append(f"• `{d['user_id']}` — {reason}")
-        text = "\n".join(lines)
-
-    await safe_edit(query, text, back_to_panel_kb(chat_id))
-
-
-async def cb_logs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    chat_id = int(query.data.split("|")[1])
-
-    with db_cursor() as c:
-        c.execute(
-            "SELECT * FROM logs WHERE chat_id=%s ORDER BY ts DESC LIMIT 10",
-            (chat_id,),
-        )
-        docs = [parse_db_row(r) for r in c.fetchall()]
-
-    if not docs:
-        text = "📭 Koi logs nahi mili."
-    else:
-        lines = ["📋 *Recent Logs (Last 10):*\n"]
-        for d in docs:
-            ts_str = d["ts"].strftime("%d/%m %H:%M") if isinstance(d["ts"], datetime) else str(d["ts"])
-            lines.append(f"`{ts_str}` | {d['action'].upper()} | `{d.get('target_id', '-')}`")
-        text = "\n".join(lines)
-
-    await safe_edit(query, text, back_to_panel_kb(chat_id))
-
-
-async def cb_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    chat_id = int(query.data.split("|")[1])
-    today = (now_ist() + timedelta(days=1)).isoformat()
-    week  = (now_ist() + timedelta(days=7)).isoformat()
-
-    with db_cursor() as c:
-        c.execute(
-            "SELECT COUNT(*) AS cnt FROM members WHERE chat_id=%s AND active=1 AND expiry<=%s",
-            (chat_id, today),
-        )
-        t_cnt = c.fetchone()["cnt"]
-        c.execute(
-            "SELECT COUNT(*) AS cnt FROM members WHERE chat_id=%s AND active=1 AND expiry<=%s",
-            (chat_id, week),
-        )
-        w_cnt = c.fetchone()["cnt"]
-
-    await safe_edit(
-        query,
-        f"📋 *Expiry Report*\n\n"
-        f"⚠️ Aaj expire ho rahe : *{t_cnt}*\n"
-        f"📅 Is hafte expire    : *{w_cnt}*",
-        main_panel_keyboard(chat_id),
-    )
-
-
-async def cb_mlist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    _, chat_id_s, page_s = query.data.split("|")
-    chat_id, page = int(chat_id_s), int(page_s)
-
-    with db_cursor() as c:
-        c.execute(
-            "SELECT * FROM members WHERE chat_id=%s AND active=1 ORDER BY expiry ASC",
-            (chat_id,),
-        )
-        docs = [parse_db_row(r) for r in c.fetchall()]
-
-    total = len(docs)
-    chunk = docs[page * PER_PAGE : (page + 1) * PER_PAGE]
-
-    lines = [f"👥 *Active Members — Page {page + 1} | Total: {total}*\n"]
-    for i, d in enumerate(chunk, page * PER_PAGE + 1):
-        em  = expiry_emoji(d["expiry"])       # ✅ timedelta-based, not string-parse
-        rem = format_time_left(d["expiry"])
-        lines.append(f"{i}. `{d['user_id']}` {em} {rem} — {_to_aware(d['expiry']).strftime('%d %b')}")
-
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"mlist|{chat_id}|{page - 1}"))
-    if (page + 1) * PER_PAGE < total:
-        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"mlist|{chat_id}|{page + 1}"))
-
-    kb_rows = []
-    if nav:
-        kb_rows.append(nav)
-    kb_rows.append([InlineKeyboardButton("🔙 Back to Panel", callback_data=f"panel|{chat_id}")])
-
-    await safe_edit(query, "\n".join(lines), InlineKeyboardMarkup(kb_rows))
-
-
-async def cb_memberinfo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    _, chat_id_s, user_id_s = query.data.split("|")
-    chat_id, user_id = int(chat_id_s), int(user_id_s)
-
-    with db_cursor() as c:
-        c.execute(
-            "SELECT * FROM members WHERE chat_id=%s AND user_id=%s",
-            (chat_id, user_id),
-        )
-        doc = parse_db_row(c.fetchone())
-
-    if not doc:
-        await safe_edit(query, "❌ Record nahi mila.")
+async def on_my_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    r = update.my_chat_member
+    if r.chat.type == "private":
         return
-
-    em  = expiry_emoji(doc["expiry"])
-    rem = format_time_left(doc["expiry"])
-    status = "🟢 Active" if doc["active"] else "🔴 Expired"
-
-    await safe_edit(
-        query,
-        f"👤 *Member Info*\n\n"
-        f"🆔 ID     : `{user_id}`\n"
-        f"Status    : {status}\n"
-        f"📅 Expiry : *{fmt_expiry(doc['expiry'])} IST*\n"
-        f"⏳ Baaki  : {em} *{rem}*",
-        member_action_keyboard(chat_id, user_id),
-    )
+    was = r.old_chat_member.status in _ADMIN
+    is_now = r.new_chat_member.status in _ADMIN
+    if is_now and not was:
+        q("""INSERT INTO groups (chat_id,title,added_by,ts) VALUES (%s,%s,%s,%s)
+             ON CONFLICT (chat_id) DO UPDATE SET title=EXCLUDED.title, added_by=EXCLUDED.added_by""",
+          (r.chat.id, r.chat.title, r.from_user.id, now().isoformat()))
+        await pm(context.bot, r.from_user.id,
+                 f"✅ {r.chat.title} register ho gaya.\n\n"
+                 "Ab jab bhi koi naya member join karega, main yahan bataunga. "
+                 "Us message par reply karke  /add 30  likhna.\n\n/start — sab commands")
+    elif was and not is_now and r.new_chat_member.status in (ChatMember.LEFT, ChatMember.BANNED):
+        q("DELETE FROM groups WHERE chat_id=%s", (r.chat.id,))
 
 
-async def cb_extmenu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    _, chat_id, user_id = query.data.split("|")
-    await safe_edit(
-        query,
-        f"➕ *Extend karein:* `{user_id}`",
-        extend_menu_keyboard(int(chat_id), int(user_id)),
-    )
-
-
-async def cb_doext(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer("⏳ Processing…")
-    _, chat_id_s, user_id_s, plan_str = query.data.split("|")
-    chat_id, user_id = int(chat_id_s), int(user_id_s)
-
-    new_expiry = await extend_membership(chat_id, user_id, plan_str, query.from_user.id)
-    if not new_expiry:
-        await query.answer("❌ Member active nahi hai!", show_alert=True)
+async def on_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    r = update.chat_member
+    u = r.new_chat_member.user
+    if u.is_bot:
         return
+    joined = (r.old_chat_member.status in (ChatMember.LEFT, ChatMember.BANNED)
+              and r.new_chat_member.status in (ChatMember.MEMBER, ChatMember.RESTRICTED))
+    if not joined:
+        return
+    row = q("SELECT added_by FROM groups WHERE chat_id=%s", (r.chat.id,), "one")
+    if not row:
+        return
+    await pm(context.bot, row[0],
+             f"🆕 Naya member\n"
+             f"👤 {u.full_name}\n"
+             f"ID: {u.id}\n"
+             f"📌 {r.chat.title}\n"
+             f"Group ID: {r.chat.id}\n\n"
+             f"👉 Is message par reply karo:  /add 30")
 
-    try:
-        chat = await context.bot.get_chat(chat_id)
-        await send_pm(
-            context, user_id,
-            f"🎉 *Extended!*\n"
-            f"📌 Group: {escape_md(chat.title)}\n"
-            f"➕ Added : {plan_str.upper()}\n"
-            f"📅 New Expiry: {fmt_expiry(new_expiry)} IST",
-        )
-    except TelegramError:
+
+# --------------------------------------------------------------------------
+# Background sweep: auto-kick expired + 24h reminder
+# --------------------------------------------------------------------------
+async def sweep(bot) -> None:
+    rows = q("""SELECT m.chat_id, m.user_id, g.title FROM members m
+                LEFT JOIN groups g ON g.chat_id = m.chat_id
+                WHERE m.active=1 AND m.expiry<=%s LIMIT 200""", (now().isoformat(),), "all") or []
+    for cid, uid, title in rows:
+        deactivate(cid, uid, "expired")
+        await kick(bot, cid, uid)
+        await pm(bot, uid, f"⏰ {title or 'Group'} ki membership khatam ho gayi.\nRenew ke liye admin se contact karo.")
+        await asyncio.sleep(0.3)  # gentle on Telegram rate limits
+
+
+async def remind(bot) -> None:
+    t = now()
+    lo, hi = (t + timedelta(hours=REMIND_HOURS - 1)).isoformat(), (t + timedelta(hours=REMIND_HOURS + 1)).isoformat()
+    rows = q("""SELECT m.chat_id, m.user_id, m.expiry, g.title FROM members m
+                LEFT JOIN groups g ON g.chat_id = m.chat_id
+                WHERE m.active=1 AND m.expiry BETWEEN %s AND %s AND m.last_reminded IS NULL LIMIT 200""",
+             (lo, hi), "all") or []
+    for cid, uid, exp, title in rows:
+        d = to_dt(exp)
+        if await pm(bot, uid, f"⚠️ {title or 'Group'} ki membership {left(d) if d else '24 ghante'} me khatam hogi.\n"
+                              "Renew ke liye admin se contact karo."):
+            q("UPDATE members SET last_reminded=%s WHERE chat_id=%s AND user_id=%s", (t.isoformat(), cid, uid))
+        await asyncio.sleep(0.3)
+
+
+async def worker(app: Application) -> None:
+    n = 0
+    while True:
+        try:
+            await sweep(app.bot)
+            if n % REMIND_EVERY == 0:
+                await remind(app.bot)
+        except Exception:
+            log.exception("sweep failed")
+        n += 1
+        await asyncio.sleep(SWEEP_INTERVAL)
+
+
+async def _post_init(app: Application) -> None:
+    app.bot_data["worker"] = asyncio.get_running_loop().create_task(worker(app))
+    log.info("Bot started. Sweep every %ss.", SWEEP_INTERVAL)
+
+
+async def _post_shutdown(app: Application) -> None:
+    t = app.bot_data.get("worker")
+    if t:
+        t.cancel()
+    if _pool:
+        _pool.closeall()
+
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    log.error("Error: %s", context.error)
+
+
+# --------------------------------------------------------------------------
+# Tiny health server (only when PORT is set, e.g. Render)
+# --------------------------------------------------------------------------
+class _Health(BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = b"ok"
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *a):  # silence
         pass
 
-    await safe_edit(
-        query,
-        f"✅ `{user_id}` ko *{plan_str.upper()}* extend kar diya!\n"
-        f"📅 New Expiry: *{fmt_expiry(new_expiry)} IST*",
-    )
-    await query.answer("✅ Extended!", show_alert=True)
+
+def _serve_health(port: int) -> None:
+    HTTPServer(("0.0.0.0", port), _Health).serve_forever()
 
 
-async def cb_remconfirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    _, chat_id, user_id = query.data.split("|")
-    await safe_edit(
-        query,
-        f"⚠️ *Confirm:* `{user_id}` ko remove karein?",
-        InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Haan", callback_data=f"doremove|{chat_id}|{user_id}"),
-            InlineKeyboardButton("❌ Cancel", callback_data="cancel"),
-        ]]),
-    )
-
-
-async def cb_doremove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer("⏳ Processing…")
-    _, chat_id_s, user_id_s = query.data.split("|")
-    chat_id, user_id = int(chat_id_s), int(user_id_s)
-
-    await remove_membership(chat_id, user_id, query.from_user.id, "manual_remove")
-    kicked = await kick_member(chat_id, user_id, context)
-
-    await safe_edit(
-        query,
-        f"{'✅ Kick kar diya' if kicked else '⚠️ Sirf DB update (Kick fail)'}: `{user_id}`",
-    )
-    await query.answer("✅ Removed!", show_alert=True)
-
-
-# ==========================================================================
-#  BACKGROUND JOBS
-# ==========================================================================
-async def auto_kick_expired(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Single query fetches ALL expired members — no N+1 issue."""
-    with db_cursor() as c:
-        c.execute(
-            "SELECT * FROM members WHERE active=1 AND expiry<=%s",
-            (now_ist().isoformat(),),
-        )
-        expired = [parse_db_row(r) for r in c.fetchall()]
-
-    if expired:
-        log.info("Auto-kick sweep: %d expired members found.", len(expired))
-
-    for d in expired:
-        await remove_membership(d["chat_id"], d["user_id"], 0, "auto_expired")
-        await kick_member(d["chat_id"], d["user_id"], context)
-        try:
-            chat = await context.bot.get_chat(d["chat_id"])
-            await send_pm(
-                context, d["user_id"],
-                f"⏰ *Membership Expire Ho Gayi!*\n"
-                f"📌 Group: {escape_md(chat.title)}\n"
-                "🔄 Renew karne ke liye admin se contact karein.",
-            )
-        except TelegramError:
-            pass
-
-
-async def send_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Remind members whose expiry is ~72h or ~24h away.
-    Uses `last_reminded` column to prevent duplicate pings on the same window.
-    """
-    for hrs in REMINDER_HOURS:
-        window_start = (now_ist() + timedelta(hours=hrs - 1)).isoformat()
-        window_end   = (now_ist() + timedelta(hours=hrs + 1)).isoformat()
-
-        with db_cursor() as c:
-            # ✅ Only fetch rows where last_reminded is NULL OR was sent >hrs-2 hours ago
-            c.execute(
-                """
-                SELECT * FROM members
-                WHERE active=1
-                  AND expiry >= %s AND expiry <= %s
-                  AND (
-                    last_reminded IS NULL
-                    OR last_reminded < %s
-                  )
-                """,
-                (window_start, window_end, (now_ist() - timedelta(hours=hrs - 2)).isoformat()),
-            )
-            docs = [parse_db_row(r) for r in c.fetchall()]
-
-        for d in docs:
-            try:
-                chat = await context.bot.get_chat(d["chat_id"])
-                sent = await send_pm(
-                    context, d["user_id"],
-                    f"⚠️ *Membership Reminder*\n"
-                    f"📌 Group: {escape_md(chat.title)}\n"
-                    f"⏳ Sirf *{format_time_left(d['expiry'])}* baaki!\n"
-                    "🔄 Expiry se pehle renew karein.",
-                )
-                if sent:
-                    # Mark reminded so we don't ping again in next sweep
-                    with db_cursor() as c2:
-                        c2.execute(
-                            "UPDATE members SET last_reminded=%s WHERE chat_id=%s AND user_id=%s",
-                            (now_ist().isoformat(), d["chat_id"], d["user_id"]),
-                        )
-            except TelegramError:
-                pass
-
-
-async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    log.exception("Unhandled exception", exc_info=context.error)
-
-
-# ==========================================================================
-#  ENTRY POINT
-# ==========================================================================
+# --------------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------------
 def main() -> None:
     if not BOT_TOKEN or not DATABASE_URL:
-        log.critical("❌ BOT_TOKEN aur DATABASE_URL set karein environment variables mein.")
+        log.critical("BOT_TOKEN aur DATABASE_URL env me set karo.")
         sys.exit(1)
 
     init_db()
 
-    # ✅ Flask start PEHLE — Render ko port binding chahiye before polling begins
-    flask_thread = threading.Thread(target=_run_flask, daemon=True, name="flask-server")
-    flask_thread.start()
-    time.sleep(1)   # give Flask a moment to bind the port
+    if PORT.isdigit():
+        threading.Thread(target=_serve_health, args=(int(PORT),), daemon=True).start()
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(_post_init)
+        .post_shutdown(_post_shutdown)
+        .build()
+    )
 
-    # Commands
-    app.add_handler(CommandHandler("start",        cmd_start))
-    app.add_handler(CommandHandler("help",         cmd_help))
-    app.add_handler(CommandHandler("setup",        cmd_setup))
-    app.add_handler(CommandHandler("addmember",    cmd_addmember))
-    app.add_handler(CommandHandler("removemember", cmd_removemember))
-    app.add_handler(CommandHandler("extend",       cmd_extend))
-    app.add_handler(CommandHandler("panel",        cmd_panel))
+    private = filters.ChatType.PRIVATE
+    for name, fn in (("start", cmd_start), ("help", cmd_start), ("add", cmd_add), ("remove", cmd_remove),
+                     ("check", cmd_check), ("list", cmd_list), ("groups", cmd_groups)):
+        app.add_handler(CommandHandler(name, fn, filters=private))
+    app.add_handler(CommandHandler(["start", "help", "add", "remove", "check", "list", "groups"],
+                                   cmd_in_group, filters=~private))
 
-    # Chat member events
-    app.add_handler(ChatMemberHandler(track_bot_promotion, ChatMemberHandler.MY_CHAT_MEMBER))
-    app.add_handler(ChatMemberHandler(track_chat_member,   ChatMemberHandler.CHAT_MEMBER))
+    app.add_handler(ChatMemberHandler(on_my_status, ChatMemberHandler.MY_CHAT_MEMBER))
+    app.add_handler(ChatMemberHandler(on_member, ChatMemberHandler.CHAT_MEMBER))
+    app.add_error_handler(on_error)
 
-    # Callback queries — (handler, pattern) pairs
-    _cb_routes = [
-        (cb_plan,       r"^plan\|"),
-        (cb_custom,     r"^custom\|"),
-        (cb_confirm,    r"^confirm\|"),
-        (cb_cancel,     r"^cancel$"),
-        (cb_mlist,      r"^mlist\|"),
-        (cb_stats,      r"^stats\|"),
-        (cb_expiring,   r"^expiring\|"),
-        (cb_expired,    r"^expired\|"),
-        (cb_logs,       r"^logs\|"),
-        (cb_report,     r"^report\|"),
-        (cb_panel,      r"^panel\|"),
-        (cb_memberinfo, r"^memberinfo\|"),
-        (cb_extmenu,    r"^extmenu\|"),
-        (cb_doext,      r"^doext\|"),
-        (cb_remconfirm, r"^remconfirm\|"),
-        (cb_doremove,   r"^doremove\|"),
-    ]
-    for handler, pattern in _cb_routes:
-        app.add_handler(CallbackQueryHandler(handler, pattern=pattern))
-
-    app.add_error_handler(global_error_handler)
-
-    # Background jobs
-    app.job_queue.run_repeating(auto_kick_expired, interval=AUTO_KICK_INTERVAL, first=10)
-    app.job_queue.run_repeating(send_reminders,    interval=REMINDER_INTERVAL,  first=30)
-
-    log.info("🤖 Membership Manager Bot v12.0 starting (Supabase + Flask)…")
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    app.run_polling(
+        allowed_updates=["message", "chat_member", "my_chat_member"],
+        drop_pending_updates=True,
+    )
 
 
 if __name__ == "__main__":
