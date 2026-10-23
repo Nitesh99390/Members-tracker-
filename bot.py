@@ -122,36 +122,55 @@ def fmt(dt: datetime) -> str:
 # --------------------------------------------------------------------------
 # Database (tiny pool, tuple rows, auto-reconnect)
 # --------------------------------------------------------------------------
-_pool: Optional[pg_pool.SimpleConnectionPool] = None
+DB_MAX = 3
+_pool: Optional[pg_pool.ThreadedConnectionPool] = None
+_sem: Optional[asyncio.Semaphore] = None   # never hand out more than DB_MAX connections
 
 
-def _get_pool() -> pg_pool.SimpleConnectionPool:
+def _get_pool() -> pg_pool.ThreadedConnectionPool:
     global _pool
     if _pool is None:
-        _pool = pg_pool.SimpleConnectionPool(1, 3, DATABASE_URL)
+        _pool = pg_pool.ThreadedConnectionPool(1, DB_MAX, DATABASE_URL, connect_timeout=10)
     return _pool
 
 
 def q(sql: str, args: tuple = (), fetch: str = "") -> object:
-    """Run one statement. fetch = '' | 'one' | 'all'. Retries once on a dead connection."""
+    """Run one statement (sync). fetch = '' | 'one' | 'all'. Retries once on a dead connection."""
     p = _get_pool()
     for attempt in (1, 2):
         conn = p.getconn()
+        broken = False
         try:
             with conn.cursor() as cur:
                 cur.execute(sql, args)
                 out = cur.fetchone() if fetch == "one" else cur.fetchall() if fetch == "all" else None
             conn.commit()
-            p.putconn(conn)
             return out
         except (psycopg2.OperationalError, psycopg2.InterfaceError):
-            p.putconn(conn, close=True)
+            broken = True
             if attempt == 2:
                 raise
         except Exception:
-            conn.rollback()
-            p.putconn(conn)
+            try:
+                conn.rollback()
+            except Exception:
+                broken = True
             raise
+        finally:
+            p.putconn(conn, close=broken)
+
+
+async def run_db(fn, *args):
+    """Run a blocking DB function off the event loop so one slow query never freezes the bot."""
+    global _sem
+    if _sem is None:
+        _sem = asyncio.Semaphore(DB_MAX)
+    async with _sem:
+        return await asyncio.to_thread(fn, *args)
+
+
+async def aq(sql: str, args: tuple = (), fetch: str = "") -> object:
+    return await run_db(q, sql, args, fetch)
 
 
 def init_db() -> None:
@@ -258,39 +277,54 @@ HELP = (
     "Us message par reply karke sirf  /add 30  likho — ho gaya."
 )
 
-_ID_RE = re.compile(r"ID:\s*(\d+)")
-_GID_RE = re.compile(r"Group ID:\s*(-?\d+)")
+_ID_RE = re.compile(r"^ID:\s*(\d+)\s*$", re.M)
+_GID_RE = re.compile(r"^Group ID:\s*(-?\d+)\s*$", re.M)
 
 
-def _target_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> tuple[Optional[int], Optional[str]]:
-    """Figure out which group a command refers to. Returns (chat_id, error_text)."""
+def _reply_text(update: Update) -> str:
+    """Text of the message being replied to — only if it is one of OUR join alerts."""
     rep = update.message.reply_to_message
-    if rep and rep.text:
-        m = _GID_RE.search(rep.text)
-        if m:
-            return int(m.group(1)), None
+    if rep and rep.from_user and rep.from_user.is_bot and rep.text:
+        return rep.text
+    return ""
 
-    groups = my_groups(update.effective_user.id)
+
+async def _target_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> tuple[Optional[int], Optional[str], str]:
+    """Which group does this command refer to? Returns (chat_id, error_text, title)."""
+    groups = await run_db(my_groups, update.effective_user.id)
     if not groups:
-        return None, "❌ Koi group registered nahi hai. Pehle mujhe group me Admin banao."
+        return None, "❌ Koi group registered nahi hai. Pehle mujhe group me Admin banao.", ""
+
+    m = _GID_RE.search(_reply_text(update))
+    if m:
+        gid = int(m.group(1))
+        title = next((t for c, t in groups if c == gid), None)
+        if title is not None:
+            return gid, None, title
+
     if len(groups) == 1:
-        return groups[0][0], None
+        return groups[0][0], None, groups[0][1]
 
     sel = context.user_data.get("g")
-    if sel and any(sel == g[0] for g in groups):
-        return sel, None
-    return None, f"Aapke {len(groups)} groups hain. Pehle /groups se ek select karo."
+    title = next((t for c, t in groups if c == sel), None)
+    if title is not None:
+        return sel, None, title
+    return None, f"Aapke {len(groups)} groups hain. Pehle /groups se ek select karo.", ""
 
 
-def _target_user(update: Update, args: list[str]) -> tuple[Optional[int], list[str]]:
-    """User id from args, or from the replied-to join message. Returns (user_id, remaining_args)."""
-    if args and args[0].isdigit():
+def _target_user(update: Update, args: list[str], extra: int = 0) -> tuple[Optional[int], list[str]]:
+    """
+    Resolve the target user id.
+    `extra` = how many args the command needs AFTER the user id (1 for /add, 0 for /remove, /check).
+    - If enough args are present and the first is numeric -> it is the user id.
+    - Otherwise fall back to the 'ID: ...' line of the replied-to join alert.
+    Fixes: replying '/add 30' used to treat 30 as the user id.
+    """
+    if len(args) > extra and args[0].isdigit():
         return int(args[0]), args[1:]
-    rep = update.message.reply_to_message
-    if rep and rep.text:
-        m = _ID_RE.search(rep.text)
-        if m:
-            return int(m.group(1)), args
+    m = _ID_RE.search(_reply_text(update))
+    if m:
+        return int(m.group(1)), args
     return None, args
 
 
@@ -302,7 +336,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_groups(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    groups = my_groups(update.effective_user.id)
+    groups = await run_db(my_groups, update.effective_user.id)
     if not groups:
         return await reply(update, "❌ Koi group registered nahi hai. Pehle mujhe group me Admin banao.")
 
@@ -324,7 +358,7 @@ async def cmd_groups(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    uid, rest = _target_user(update, context.args)
+    uid, rest = _target_user(update, context.args, extra=1)
     if uid is None or not rest:
         return await reply(update, "Use:  /add <user_id> <days>\nExample:  /add 123456789 30\n\n"
                                    "Ya join-message par reply karke:  /add 30")
@@ -332,12 +366,11 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if td is None:
         return await reply(update, "❌ Days galat hai. Example: 30  (ya 12h, 45m)")
 
-    cid, err = _target_group(update, context)
+    cid, err, title = await _target_group(update, context)
     if err:
         return await reply(update, err)
 
-    expiry = upsert_member(cid, uid, td, rest[0], update.effective_user.id)
-    title = next((t for c, t in my_groups(update.effective_user.id) if c == cid), str(cid))
+    expiry = await run_db(upsert_member, cid, uid, td, rest[0], update.effective_user.id)
 
     sent = await pm(context.bot, uid,
                     f"✅ {title} me aapki membership active hai.\n"
@@ -351,11 +384,11 @@ async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     uid, _ = _target_user(update, context.args)
     if uid is None:
         return await reply(update, "Use:  /remove <user_id>")
-    cid, err = _target_group(update, context)
+    cid, err, _t = await _target_group(update, context)
     if err:
         return await reply(update, err)
 
-    deactivate(cid, uid, "manual")
+    await run_db(deactivate, cid, uid, "manual")
     ok = await kick(context.bot, cid, uid)
     await reply(update, f"{'✅ Member group se nikaal diya' if ok else '⚠️ Record update hua, par kick nahi ho paya (bot admin hai?)'}: {uid}")
 
@@ -364,11 +397,11 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     uid, _ = _target_user(update, context.args)
     if uid is None:
         return await reply(update, "Use:  /check <user_id>")
-    cid, err = _target_group(update, context)
+    cid, err, _t = await _target_group(update, context)
     if err:
         return await reply(update, err)
 
-    row = q("SELECT expiry, active FROM members WHERE chat_id=%s AND user_id=%s", (cid, uid), "one")
+    row = await aq("SELECT expiry, active FROM members WHERE chat_id=%s AND user_id=%s", (cid, uid), "one")
     if not row:
         return await reply(update, f"❌ {uid} ka koi record nahi.")
     exp = to_dt(row[0])
@@ -377,10 +410,10 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    cid, err = _target_group(update, context)
+    cid, err, _t = await _target_group(update, context)
     if err:
         return await reply(update, err)
-    rows = q("SELECT user_id, expiry FROM members WHERE chat_id=%s AND active=1 ORDER BY expiry", (cid,), "all") or []
+    rows = await aq("SELECT user_id, expiry FROM members WHERE chat_id=%s AND active=1 ORDER BY expiry", (cid,), "all") or []
     if not rows:
         return await reply(update, "Koi active member nahi hai.")
     lines = [f"👥 Active members: {len(rows)}\n"]
@@ -412,15 +445,15 @@ async def on_my_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     was = r.old_chat_member.status in _ADMIN
     is_now = r.new_chat_member.status in _ADMIN
     if is_now and not was:
-        q("""INSERT INTO groups (chat_id,title,added_by,ts) VALUES (%s,%s,%s,%s)
-             ON CONFLICT (chat_id) DO UPDATE SET title=EXCLUDED.title, added_by=EXCLUDED.added_by""",
-          (r.chat.id, r.chat.title, r.from_user.id, now().isoformat()))
+        await aq("""INSERT INTO groups (chat_id,title,added_by,ts) VALUES (%s,%s,%s,%s)
+                    ON CONFLICT (chat_id) DO UPDATE SET title=EXCLUDED.title, added_by=EXCLUDED.added_by""",
+                 (r.chat.id, r.chat.title, r.from_user.id, now().isoformat()))
         await pm(context.bot, r.from_user.id,
                  f"✅ {r.chat.title} register ho gaya.\n\n"
                  "Ab jab bhi koi naya member join karega, main yahan bataunga. "
                  "Us message par reply karke  /add 30  likhna.\n\n/start — sab commands")
     elif was and not is_now and r.new_chat_member.status in (ChatMember.LEFT, ChatMember.BANNED):
-        q("DELETE FROM groups WHERE chat_id=%s", (r.chat.id,))
+        await aq("DELETE FROM groups WHERE chat_id=%s", (r.chat.id,))
 
 
 async def on_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -432,7 +465,7 @@ async def on_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
               and r.new_chat_member.status in (ChatMember.MEMBER, ChatMember.RESTRICTED))
     if not joined:
         return
-    row = q("SELECT added_by FROM groups WHERE chat_id=%s", (r.chat.id,), "one")
+    row = await aq("SELECT added_by FROM groups WHERE chat_id=%s", (r.chat.id,), "one")
     if not row:
         return
     await pm(context.bot, row[0],
@@ -448,11 +481,11 @@ async def on_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # Background sweep: auto-kick expired + 24h reminder
 # --------------------------------------------------------------------------
 async def sweep(bot) -> None:
-    rows = q("""SELECT m.chat_id, m.user_id, g.title FROM members m
-                LEFT JOIN groups g ON g.chat_id = m.chat_id
-                WHERE m.active=1 AND m.expiry<=%s LIMIT 200""", (now().isoformat(),), "all") or []
+    rows = await aq("""SELECT m.chat_id, m.user_id, g.title FROM members m
+                       LEFT JOIN groups g ON g.chat_id = m.chat_id
+                       WHERE m.active=1 AND m.expiry<=%s LIMIT 200""", (now().isoformat(),), "all") or []
     for cid, uid, title in rows:
-        deactivate(cid, uid, "expired")
+        await run_db(deactivate, cid, uid, "expired")
         await kick(bot, cid, uid)
         await pm(bot, uid, f"⏰ {title or 'Group'} ki membership khatam ho gayi.\nRenew ke liye admin se contact karo.")
         await asyncio.sleep(0.3)  # gentle on Telegram rate limits
@@ -461,16 +494,18 @@ async def sweep(bot) -> None:
 async def remind(bot) -> None:
     t = now()
     lo, hi = (t + timedelta(hours=REMIND_HOURS - 1)).isoformat(), (t + timedelta(hours=REMIND_HOURS + 1)).isoformat()
-    rows = q("""SELECT m.chat_id, m.user_id, m.expiry, g.title FROM members m
-                LEFT JOIN groups g ON g.chat_id = m.chat_id
-                WHERE m.active=1 AND m.expiry BETWEEN %s AND %s AND m.last_reminded IS NULL LIMIT 200""",
-             (lo, hi), "all") or []
+    rows = await aq("""SELECT m.chat_id, m.user_id, m.expiry, g.title FROM members m
+                       LEFT JOIN groups g ON g.chat_id = m.chat_id
+                       WHERE m.active=1 AND m.expiry BETWEEN %s AND %s AND m.last_reminded IS NULL LIMIT 200""",
+                    (lo, hi), "all") or []
     for cid, uid, exp, title in rows:
         d = to_dt(exp)
-        if await pm(bot, uid, f"⚠️ {title or 'Group'} ki membership {left(d) if d else '24 ghante'} me khatam hogi.\n"
-                              "Renew ke liye admin se contact karo."):
-            q("UPDATE members SET last_reminded=%s WHERE chat_id=%s AND user_id=%s", (t.isoformat(), cid, uid))
-        await asyncio.sleep(0.3)
+        sent = await pm(bot, uid, f"⚠️ {title or 'Group'} ki membership {left(d) if d else '24 ghante'} me khatam hogi.\n"
+                                  "Renew ke liye admin se contact karo.")
+        # Mark reminded even if PM is blocked — otherwise we retry the same user every hour forever.
+        await aq("UPDATE members SET last_reminded=%s WHERE chat_id=%s AND user_id=%s", (t.isoformat(), cid, uid))
+        if sent:
+            await asyncio.sleep(0.3)
 
 
 async def worker(app: Application) -> None:
@@ -486,15 +521,18 @@ async def worker(app: Application) -> None:
         await asyncio.sleep(SWEEP_INTERVAL)
 
 
+_worker_task: Optional[asyncio.Task] = None
+
+
 async def _post_init(app: Application) -> None:
-    app.bot_data["worker"] = asyncio.get_running_loop().create_task(worker(app))
+    global _worker_task
+    _worker_task = asyncio.get_running_loop().create_task(worker(app))
     log.info("Bot started. Sweep every %ss.", SWEEP_INTERVAL)
 
 
 async def _post_shutdown(app: Application) -> None:
-    t = app.bot_data.get("worker")
-    if t:
-        t.cancel()
+    if _worker_task:
+        _worker_task.cancel()
     if _pool:
         _pool.closeall()
 
@@ -530,10 +568,11 @@ def main() -> None:
         log.critical("BOT_TOKEN aur DATABASE_URL env me set karo.")
         sys.exit(1)
 
-    init_db()
-
+    # Bind the port FIRST so Render/Railway health checks pass even if DB is slow to connect.
     if PORT.isdigit():
         threading.Thread(target=_serve_health, args=(int(PORT),), daemon=True).start()
+
+    init_db()
 
     app = (
         Application.builder()
